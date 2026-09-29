@@ -1,3 +1,153 @@
+# XFeat ONNX Export for the TruckImager Stitching Pipeline
+
+This is Optocycle's fork of [XFeat: Accelerated Features for Lightweight Image Matching](https://github.com/verlab/accelerated_features) (CVPR 2024). We use it to export the trained XFeat weights to ONNX. The exported models are the keypoint detector and descriptor in the improved **TruckImager image stitching pipeline**.
+
+The upstream PyTorch code (model, training, evaluation, demos) is unchanged. The Optocycle addition is the export script in [onnx_conversion/](onnx_conversion/).
+
+## What gets exported
+
+[onnx_conversion/export_xfeat_onnx.py](onnx_conversion/export_xfeat_onnx.py) exports the whole sparse XFeat detector as one graph: CNN, NMS, top-k selection and descriptor sampling. The pipeline needs no PyTorch and no post-processing beyond filtering and rescaling.
+
+| | Name | Shape | Notes |
+|---|---|---|---|
+| Input | `image` | `(B, 1, H, W)` | float32 grayscale in `[0, 1]`. `H` and `W` must be multiples of 32. Batch, height and width are dynamic. |
+| Input | `threshold` | `(1,)` | float32 keypoint detection threshold (XFeat default `0.05`). It is a run-time input, so you can tune it without re-exporting. |
+| Output | `keypoints` | `(B, K, 2)` | `(x, y)` pixel coordinates in the network input image, sorted by descending score. |
+| Output | `scores` | `(B, K)` | Padding rows have score `-1`. |
+| Output | `descriptors` | `(B, K, 64)` | L2-normalised. |
+
+`K` is fixed at export time (`--k-max`). The output always has exactly `K` rows. If the image has fewer than `K` keypoints above the threshold, the remaining rows are padding. The export needs `H*W >= K`.
+
+Per frame, on the consumer side:
+
+1. Resize the frame and convert it to grayscale. Both happen outside the model.
+2. Run the model.
+3. Keep rows with `scores > 0`.
+4. Rescale the keypoints from network-input pixels to original-frame pixels.
+
+The export settings (`k_max`, `nms_kernel`, opset, torch version, git commit) are stored in the ONNX metadata properties, so you can see how a `.onnx` file was produced.
+
+## Tiled mode vs. full-image mode
+
+Export one model per mode. `K` is baked into the graph, and a smaller `K` makes the model cheaper.
+
+| Mode | Input | Suggested `--k-max` |
+|---|---|---|
+| **Tiled**: the image is split into tiles, and features are extracted per tile | tile | `128` |
+| **Full image**: features are extracted from the whole frame | whole frame | `1024` |
+
+```bash
+# Tiled mode
+poetry run python onnx_conversion/export_xfeat_onnx.py --k-max 128  --out onnx_conversion/xfeat_tile_128.onnx
+
+# Full-image mode
+poetry run python onnx_conversion/export_xfeat_onnx.py --k-max 1024 --out onnx_conversion/xfeat_full_1024.onnx
+```
+
+The values above are starting points. Pick `K` to match the number of keypoints your stitching stage can use. You can use fewer than `K` at run time by slicing the (sorted) outputs. You cannot get more without re-exporting.
+
+## Setup
+
+Requires Python 3.12 and [Poetry](https://python-poetry.org/). The environment installs CPU PyTorch 2.3.1, ONNX and ONNX Runtime.
+
+```bash
+git clone <this repository>
+cd accelerated_features
+poetry install
+```
+
+The trained weights are in [weights/xfeat.pt](weights/xfeat.pt) and are the default input.
+
+## Export options
+
+```bash
+poetry run python onnx_conversion/export_xfeat_onnx.py --help
+```
+
+| Flag | Default | Description |
+|---|---|---|
+| `--weights` | `weights/xfeat.pt` | Trained XFeat weights. |
+| `--out` | `onnx_conversion/xfeat.onnx` | Output file. |
+| `--k-max` | `4096` | Rows per output (`K`). See the table above. |
+| `--nms-kernel` | `5` | NMS max-pool window. XFeat uses 5. |
+| `--opset` | `17` | ONNX opset. `GridSample` needs 16 or higher. |
+| `--threshold` | `0.05` | Threshold used by the built-in checks only. |
+| `--dummy-hw H W` | `640 576` | Resolution used for tracing. The exported graph still accepts any size that is a multiple of 32. |
+| `--check-hw H W` | `512 608` | A second resolution for the checks, to verify the dynamic axes. |
+| `--video PATH` `--frame N` | none | Optionally check on a real frame (for example a TruckImager video) as well as the synthetic images. |
+
+Set `--k-max` to the value you will deploy. Note that `--k-max` is also the top-k of the PyTorch reference used in the checks. Use `--video` with a frame from your own footage when you want a meaningful check.
+
+## Verification
+
+Every export runs two comparisons against the reference `XFeat.detectAndCompute` on noise, flat and (optionally) real images at two resolutions:
+
+1. The PyTorch wrapper against the reference.
+2. The exported model run in ONNX Runtime against the reference.
+
+For each image the script prints how many keypoints both versions found, how many are unique to each, and the maximum score and descriptor difference on the shared keypoints. The graph is written by the export step even if these numbers look off, so read the output before using a model.
+
+Keep in mind that ties and near-threshold peaks can make a few keypoints differ between top-k and the reference's sort. Scores and descriptors on shared keypoints should agree to float precision.
+
+Exported `*.onnx` and `*.onnx.data` files are git-ignored and are not versioned. Re-create them from the weights with the commands above, and use the metadata to trace where a file came from.
+
+## Using the model
+
+```python
+import numpy as np
+import onnxruntime as ort
+
+session = ort.InferenceSession("onnx_conversion/xfeat_tile_128.onnx", providers=["CPUExecutionProvider"])
+
+image = np.random.rand(1, 1, 256, 256).astype(np.float32)   # gray, [0, 1], H and W multiples of 32
+threshold = np.array([0.05], dtype=np.float32)
+
+keypoints, scores, descriptors = session.run(None, {"image": image, "threshold": threshold})
+
+keep = scores[0] > 0
+kpts, desc = keypoints[0][keep], descriptors[0][keep]        # (N, 2), (N, 64)
+```
+
+The resulting keypoints and descriptors can be matched with any matcher, for example a mutual nearest neighbour search on the descriptors.
+
+## Using the PyTorch model
+
+The upstream API still works, for prototyping and for comparison with the ONNX output:
+
+```python
+import torch
+from modules.xfeat import XFeat
+
+xfeat = XFeat()
+output = xfeat.detectAndCompute(torch.randn(1, 1, 480, 640), top_k=1024)[0]
+```
+
+Upstream evaluation (MegaDepth-1500, ScanNet-1500), training, the real-time demo and the XFeat + LighterGlue matcher are still in the repository. They are documented in the [original XFeat README](#original-xfeat-readme) below. Those scripts have their own dependencies (see [requirements.txt](requirements.txt)) that the Poetry environment does not install.
+
+## Attribution and license
+
+XFeat was created by Guilherme Potje, Felipe Cadar, Andre Araujo, Renato Martins and Erickson R. Nascimento (VeRLab, UFMG). Please cite the paper if you use it:
+
+```bibtex
+@INPROCEEDINGS{potje2024cvpr,
+  author={Potje, Guilherme and Cadar, Felipe and Araujo, André and Martins, Renato and Nascimento, Erickson R.},
+  booktitle={2024 IEEE/CVF Conference on Computer Vision and Pattern Recognition (CVPR)},
+  title={XFeat: Accelerated Features for Lightweight Image Matching},
+  year={2024},
+  pages={2682-2691},
+  doi={10.1109/CVPR52733.2024.00259}}
+```
+
+Licensed under Apache 2.0, see [LICENSE](LICENSE).
+
+---
+
+# Original XFeat README
+
+Everything below is the unmodified upstream README from [verlab/accelerated_features](https://github.com/verlab/accelerated_features).
+
+---
+
 ## XFeat: Accelerated Features for Lightweight Image Matching
 [Guilherme Potje](https://guipotje.github.io/) · [Felipe Cadar](https://eucadar.com/) · [Andre Araujo](https://andrefaraujo.github.io/) · [Renato Martins](https://renatojmsdh.github.io/) · [Erickson R. Nascimento](https://homepages.dcc.ufmg.br/~erickson/)
 
