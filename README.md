@@ -2,11 +2,11 @@
 
 This is Optocycle's fork of [XFeat: Accelerated Features for Lightweight Image Matching](https://github.com/verlab/accelerated_features) (CVPR 2024). We use it to export the trained XFeat weights to ONNX. The exported models are the keypoint detector and descriptor in the improved **TruckImager image stitching pipeline**.
 
-The upstream PyTorch code (model, training, evaluation, demos) is unchanged. The Optocycle addition is the export script in [onnx_conversion/](onnx_conversion/).
+The upstream PyTorch code (model, training, evaluation, demos) is unchanged. The Optocycle additions are the export script and the MLflow/Triton publishing in [deployment/](deployment/).
 
 ## What gets exported
 
-[onnx_conversion/export_xfeat_onnx.py](onnx_conversion/export_xfeat_onnx.py) exports the whole sparse XFeat detector as one graph: CNN, NMS, top-k selection and descriptor sampling. The pipeline needs no PyTorch and no post-processing beyond filtering and rescaling.
+[deployment/export_xfeat_onnx.py](deployment/export_xfeat_onnx.py) exports the whole sparse XFeat detector as one graph: CNN, NMS, top-k selection and descriptor sampling. The pipeline needs no PyTorch and no post-processing beyond filtering and rescaling.
 
 | | Name | Shape | Notes |
 |---|---|---|---|
@@ -38,17 +38,17 @@ Export one model per mode. `K` is baked into the graph, and a smaller `K` makes 
 
 ```bash
 # Tiled mode
-poetry run python onnx_conversion/export_xfeat_onnx.py --k-max 128  --out onnx_conversion/xfeat_tile_128.onnx
+poetry run python deployment/export_xfeat_onnx.py --k-max 128  --out deployment/xfeat_tile_128.onnx
 
 # Full-image mode
-poetry run python onnx_conversion/export_xfeat_onnx.py --k-max 1024 --out onnx_conversion/xfeat_full_1024.onnx
+poetry run python deployment/export_xfeat_onnx.py --k-max 1024 --out deployment/xfeat_full_1024.onnx
 ```
 
 The values above are starting points. Pick `K` to match the number of keypoints your stitching stage can use. You can use fewer than `K` at run time by slicing the (sorted) outputs. You cannot get more without re-exporting.
 
 ## Setup
 
-Requires Python 3.12 and [Poetry](https://python-poetry.org/). The environment installs CPU PyTorch 2.3.1, ONNX and ONNX Runtime.
+Requires Python 3.12 and [Poetry](https://python-poetry.org/). The environment installs CPU PyTorch 2.3.1, ONNX, ONNX Runtime and MLflow.
 
 ```bash
 git clone <this repository>
@@ -61,13 +61,13 @@ The trained weights are in [weights/xfeat.pt](weights/xfeat.pt) and are the defa
 ## Export options
 
 ```bash
-poetry run python onnx_conversion/export_xfeat_onnx.py --help
+poetry run python deployment/export_xfeat_onnx.py --help
 ```
 
 | Flag | Default | Description |
 |---|---|---|
 | `--weights` | `weights/xfeat.pt` | Trained XFeat weights. |
-| `--out` | `onnx_conversion/xfeat.onnx` | Output file. |
+| `--out` | `deployment/xfeat.onnx` | Output file. |
 | `--k-max` | `4096` | Rows per output (`K`). See the table above. |
 | `--nms-kernel` | `5` | NMS max-pool window. XFeat uses 5. |
 | `--opset` | `17` | ONNX opset. `GridSample` needs 16 or higher. |
@@ -97,7 +97,7 @@ Exported `*.onnx` and `*.onnx.data` files are git-ignored and are not versioned.
 import numpy as np
 import onnxruntime as ort
 
-session = ort.InferenceSession("onnx_conversion/xfeat_tile_128.onnx", providers=["CPUExecutionProvider"])
+session = ort.InferenceSession("deployment/xfeat_tile_128.onnx", providers=["CPUExecutionProvider"])
 
 image = np.random.rand(1, 1, 256, 256).astype(np.float32)   # gray, [0, 1], H and W multiples of 32
 threshold = np.array([0.05], dtype=np.float32)
@@ -109,6 +109,58 @@ kpts, desc = keypoints[0][keep], descriptors[0][keep]        # (N, 2), (N, 64)
 ```
 
 The resulting keypoints and descriptors can be matched with any matcher, for example a mutual nearest neighbour search on the descriptors.
+
+## Publishing to MLflow and Triton
+
+The models are published the same way as [optocycle/RAFT-Stereo](https://github.com/optocycle/RAFT-Stereo). Each one is logged to MLflow as a Triton model with the `triton` flavor ([deployment/triton_flavor.py](deployment/triton_flavor.py)), and then deployed to Triton with the MLflow Triton plugin from `oc_ml/inference-server`.
+
+Copy [.env.example](.env.example) to `.env` and fill in your MLflow credentials. Then export, check and publish in one run:
+
+```bash
+# Tiled mode: 4x4 tiles of 616x462 at scale 0.39 -> 256x192 network input per tile
+poetry run python deployment/export_xfeat_onnx.py --k-max 128 --dummy-hw 192 256 \
+    --out deployment/xfeat_tile_128.onnx --publish --triton-hw 192 256
+
+# Full-image mode: any size that is a multiple of 32
+poetry run python deployment/export_xfeat_onnx.py --k-max 1024 \
+    --out deployment/xfeat_full_1024.onnx --publish
+```
+
+To publish a file that was already exported, run `poetry run python deployment/publish_xfeat_triton.py <file.onnx> --triton-hw 192 256`. Add `--dry-run DIR` to write only the Triton model directory, without logging anything.
+
+| Flag | Default | Description |
+|---|---|---|
+| `--triton-hw H W` | `-1 -1` | Input height and width in `config.pbtxt`. `-1 -1` accepts any multiple of 32. For tiled mode, set it to the network size of one tile. |
+| `--experiment` | `xfeat` | MLflow experiment. It is created if it does not exist. |
+| `--registered-model-name` | none | Also registers the model under this name. Without it, register the run's `models` artifact in the MLflow UI. |
+
+Each run logs `models/model/config.pbtxt` and `models/model/1/model.onnx`. It also logs the ONNX metadata (`k_max`, `nms_kernel`, opset, torch version, commit) and the Triton input size as run parameters. `K` in `config.pbtxt` comes from the ONNX metadata, so the config always matches the graph.
+
+After registering the model, deploy it from `oc_ml/inference-server`:
+
+```bash
+poetry run mlflow deployments create -t triton --flavor triton --name xfeat_tile_k128 -m models:/<registered name>/<version>
+```
+
+The Triton config template is [deployment/xfeat.pbtxt](deployment/xfeat.pbtxt). Two of its settings differ from RAFT:
+
+- It has **no `name`**. Triton then takes the model name from its directory, which is the deployment `--name`, so the two cannot get out of sync.
+- It uses **`max_batch_size: 0`**. `threshold` has shape `(1,)` for the whole batch, so Triton cannot add a batch dimension to it. The batch dimension is therefore part of the dims (`image: [-1, 1, H, W]`). In tiled mode, send all tiles of a frame in one request, exactly as with ONNX Runtime. Triton does not merge separate requests into one batch.
+
+The Triton model has the same inputs and outputs as the ONNX file (see [What gets exported](#what-gets-exported)). A gRPC call for one frame's tiles looks like this:
+
+```python
+import numpy as np
+import tritonclient.grpc as tritonclient
+
+client = tritonclient.InferenceServerClient(url="triton-inference.oc-ml.svc:8001")
+tiles = np.random.rand(16, 1, 192, 256).astype(np.float32)  # (n_tiles, 1, H, W), gray in [0, 1]
+inputs = [tritonclient.InferInput("image", tiles.shape, "FP32"), tritonclient.InferInput("threshold", [1], "FP32")]
+inputs[0].set_data_from_numpy(tiles)
+inputs[1].set_data_from_numpy(np.array([0.05], np.float32))
+res = client.infer("xfeat_tile_k128", inputs)
+keypoints, scores = res.as_numpy("keypoints"), res.as_numpy("scores")  # (16, 128, 2), (16, 128)
+```
 
 ## Using the PyTorch model
 

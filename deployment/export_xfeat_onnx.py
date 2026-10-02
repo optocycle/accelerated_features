@@ -7,7 +7,8 @@ Outside: keep = scores > 0, slice to the configured k (<= K, TopK output is sort
          keypoints from network-input pixels to original-frame pixels.
 
 Run from the repo root:
-    .venv/bin/python onnx_conversion/export_xfeat_onnx.py --video <video0.mp4>
+    .venv/bin/python deployment/export_xfeat_onnx.py --video <video0.mp4>
+Add --publish to also log the checked file to MLflow as a Triton model (see publish_xfeat_triton.py).
 """
 
 import argparse
@@ -26,6 +27,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT))
 from modules.model import XFeatModel  # noqa: E402
 from modules.xfeat import XFeat  # noqa: E402  (reference for the checks only)
+from publish_xfeat_triton import add_publish_args, publish  # noqa: E402
 
 INPUT_NAMES = ["image", "threshold"]
 OUTPUT_NAMES = ["keypoints", "scores", "descriptors"]
@@ -207,7 +209,7 @@ def export(model: XFeatONNX, out: Path, opset: int, dummy_hw: tuple[int, int]) -
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--weights", type=Path, default=REPO_ROOT / "weights" / "xfeat.pt")
-    ap.add_argument("--out", type=Path, default=REPO_ROOT / "onnx_conversion" / "xfeat.onnx")
+    ap.add_argument("--out", type=Path, default=REPO_ROOT / "deployment" / "xfeat.onnx")
     ap.add_argument("--opset", type=int, default=17, help="GridSample needs >= 16.")
     ap.add_argument("--k-max", type=int, default=4096, help="Rows per output; slice to k at run time.")
     ap.add_argument("--nms-kernel", type=int, default=5)
@@ -217,6 +219,8 @@ def main():
     ap.add_argument("--threshold", type=float, default=0.05, help="Run-time value used by the checks.")
     ap.add_argument("--video", type=Path, default=None, help="Optional video for a real-frame check.")
     ap.add_argument("--frame", type=int, default=18)
+    ap.add_argument("--publish", action="store_true", help="Log the exported file to MLflow as a Triton model.")
+    add_publish_args(ap)
     args = ap.parse_args()
 
     net = load_net(args.weights)
@@ -245,6 +249,11 @@ def main():
         for name, img in images.items():
             k, s, d = session.run(None, {"image": img.numpy(), "threshold": threshold.numpy()})
             compare(name, k[0], s[0], d[0], refs[hw, name])
+
+    if args.publish:
+        print("4) publish to MLflow")
+        publish(args.out, tuple(args.triton_hw), args.experiment, args.registered_model_name,
+                params={"weights": args.weights.name})
 
 
 if __name__ == "__main__":
